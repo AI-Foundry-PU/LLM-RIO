@@ -1,0 +1,274 @@
+from __future__ import annotations
+
+import re
+from datetime import datetime
+from typing import Any, Literal
+
+from pydantic import (
+    AliasChoices,
+    BaseModel,
+    ConfigDict,
+    Field,
+    JsonValue,
+    field_validator,
+    model_validator,
+)
+
+from llm_rio.domain import Engine, Role
+
+
+class CreateKeyRequest(BaseModel):
+    nickname: str = Field(min_length=1, max_length=100)
+    role: Role
+    quota_account_id: str | None = None
+    quota_account_nickname: str | None = None
+    limit_tokens: int | None = Field(
+        default=None,
+        ge=0,
+        validation_alias=AliasChoices("limit_tokens", "balance_tokens"),
+    )
+    models: list[str] = Field(
+        default_factory=list,
+        validation_alias=AliasChoices("models", "model_ids"),
+    )
+    api_key: str | None = Field(default=None, min_length=24)
+
+    @field_validator("api_key")
+    @classmethod
+    def custom_api_key_uses_rio_format(cls, value: str | None) -> str | None:
+        if value is not None and not value.startswith("rio_"):
+            raise ValueError("custom API keys must start with rio_")
+        return value
+
+
+class KeySecretResponse(BaseModel):
+    id: str
+    nickname: str
+    api_key: str
+    warning: str = "Administrators can retrieve the full key later with the key-list command."
+
+
+class QuotaUpdate(BaseModel):
+    limit_tokens: int = Field(
+        ge=0,
+        validation_alias=AliasChoices("limit_tokens", "balance_tokens"),
+    )
+    unlimited: bool = False
+
+
+class UsageSummarizeRequest(BaseModel):
+    through: datetime | None = None
+
+
+class GrantUpdate(BaseModel):
+    model_ids: list[str]
+
+
+class ModelAccessUpdate(BaseModel):
+    key: str = Field(min_length=1)
+    models: list[str]
+    mode: Literal["add", "remove", "replace"] = "add"
+
+
+class RegisterModelRequest(BaseModel):
+    nickname: str = Field(pattern=r"^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$")
+    huggingface_repo: str | None = Field(default=None, pattern=r"^[^/\s]+/[^/\s]+$")
+    local_path: str | None = None
+    engine: Engine = Engine.VLLM
+    revision: str | None = None
+    grant_to_keys: list[str] = Field(
+        default_factory=list,
+        validation_alias=AliasChoices("grant_to_keys", "grant_to_key_ids"),
+    )
+
+    @model_validator(mode="after")
+    def exactly_one_source(self) -> RegisterModelRequest:
+        if bool(self.huggingface_repo) == bool(self.local_path):
+            raise ValueError("Supply exactly one of huggingface_repo or local_path")
+        if self.local_path and self.revision:
+            raise ValueError("Local artifact revisions are measured, not supplied")
+        return self
+
+
+class ModelValidationOverrides(BaseModel):
+    """Launch settings to measure and persist during registration/revalidation."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    tensor_parallel_size: int | None = Field(default=None, gt=0)
+    launch_args: dict[str, JsonValue] = Field(default_factory=dict)
+    max_model_len: int | None = Field(default=None, gt=0)
+    max_num_seqs: int | None = Field(default=None, gt=0)
+    max_num_batched_tokens: int | None = Field(default=None, gt=0)
+    gpu_memory_utilization: float | None = Field(default=None, gt=0, le=1)
+
+    @field_validator("launch_args")
+    @classmethod
+    def validate_launch_args(cls, value: dict[str, JsonValue]) -> dict[str, JsonValue]:
+        # These options belong to RIO's placement, networking, or dedicated fields.
+        reserved = {
+            "model",
+            "host",
+            "port",
+            "api_key",
+            "served_model_name",
+            "tensor_parallel_size",
+            "pipeline_parallel_size",
+            "data_parallel_size",
+            "data_parallel_rank",
+            "data_parallel_start_rank",
+            "data_parallel_size_local",
+            "data_parallel_address",
+            "data_parallel_rpc_port",
+            "distributed_executor_backend",
+            "enable_sleep_mode",
+            "max_model_len",
+            "gpu_memory_utilization",
+            "max_num_seqs",
+            "max_num_batched_tokens",
+            "config",
+        }
+        normalized: dict[str, JsonValue] = {}
+        for key, item in value.items():
+            name = key.replace("-", "_")
+            if not re.fullmatch(r"[a-z][a-z0-9_]*", name):
+                raise ValueError(f"Invalid engine argument name: {key}")
+            if name.removeprefix("no_") in reserved:
+                raise ValueError(f"{key} is managed by RIO; use its dedicated field if available")
+            if name in normalized:
+                raise ValueError(f"Duplicate engine argument: {key}")
+            if name in {"dtype", "quantization"} and not isinstance(item, str):
+                raise ValueError(f"{key} must be a string")
+            normalized[name] = item
+        return normalized
+
+
+class ModelJobRetryRequest(BaseModel):
+    """Optional replacement validation limits for a requeued registration job."""
+
+    profile_id: str | None = None
+    validation_overrides: ModelValidationOverrides | None = None
+
+
+class MaintenanceRequest(BaseModel):
+    mode: Literal["drain", "active"]
+
+
+class ProfileEditRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    """Administrator override for a validated placement profile."""
+
+    engine: Engine | None = None
+    tensor_parallel_size: int | None = Field(default=None, gt=0)
+    max_model_len: int | None = Field(default=None, gt=0)
+    max_num_seqs: int | None = Field(default=None, gt=0)
+    max_num_batched_tokens: int | None = Field(default=None, gt=0)
+    gpu_memory_utilization: float | None = Field(default=None, gt=0, le=1)
+    gguf_file: str | None = Field(default=None, min_length=1)
+    n_gpu_layers: int | None = Field(default=None, ge=0)
+    make_default: bool = False
+    restart_workers: bool = False
+
+
+ReasoningEffort = Literal["none", "minimal", "low", "medium", "high", "xhigh", "max"]
+
+
+class ModelRequestDefaultsUpdate(BaseModel):
+    """Validated request defaults for an existing logical model."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    temperature: float | None = Field(default=None, ge=0, le=2)
+    top_p: float | None = Field(default=None, gt=0, le=1)
+    top_k: int | None = Field(default=None, ge=0)
+    min_p: float | None = Field(default=None, ge=0, le=1)
+    presence_penalty: float | None = Field(default=None, ge=-2, le=2)
+    repetition_penalty: float | None = Field(default=None, gt=0)
+    reasoning_effort: ReasoningEffort | None = None
+
+
+class ModelProfileCloneRequest(BaseModel):
+    """Create a separately routable logical model from existing weights and profiles."""
+
+    nickname: str = Field(pattern=r"^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$")
+    temperature: float | None = Field(default=None, ge=0, le=2)
+    top_p: float | None = Field(default=None, gt=0, le=1)
+    top_k: int | None = Field(default=None, ge=0)
+    min_p: float | None = Field(default=None, ge=0, le=1)
+    presence_penalty: float | None = Field(default=None, ge=-2, le=2)
+    repetition_penalty: float | None = Field(default=None, gt=0)
+    reasoning_effort: ReasoningEffort | None = None
+    max_model_len: int | None = Field(default=None, gt=0)
+    yarn_factor: float | None = Field(default=None, gt=1)
+    yarn_original_max_model_len: int | None = Field(default=None, gt=0)
+    inherit_grants: bool = True
+
+    @model_validator(mode="after")
+    def yarn_fields_are_consistent(self) -> ModelProfileCloneRequest:
+        if self.yarn_original_max_model_len is not None and self.yarn_factor is None:
+            raise ValueError("yarn_original_max_model_len requires yarn_factor")
+        return self
+
+    @property
+    def request_defaults(self) -> dict[str, float | int | str]:
+        return {
+            key: value
+            for key, value in {
+                "temperature": self.temperature,
+                "top_p": self.top_p,
+                "top_k": self.top_k,
+                "min_p": self.min_p,
+                "presence_penalty": self.presence_penalty,
+                "repetition_penalty": self.repetition_penalty,
+                "reasoning_effort": self.reasoning_effort,
+            }.items()
+            if value is not None
+        }
+
+
+class ChatCompletionRequest(BaseModel):
+    model_config = {"extra": "allow"}
+
+    model: str
+    messages: list[dict[str, Any]]
+    max_tokens: int | None = Field(default=None, gt=0)
+    max_completion_tokens: int | None = Field(default=None, gt=0)
+    n: int = Field(default=1, ge=1)
+    stream: bool = False
+    stream_options: dict[str, Any] | None = None
+    temperature: float | None = None
+    top_p: float | None = None
+    top_k: int | None = None
+    reasoning_effort: ReasoningEffort | None = None
+    min_p: float | None = Field(default=None, ge=0, le=1)
+    presence_penalty: float | None = Field(default=None, ge=-2, le=2)
+    repetition_penalty: float | None = Field(default=None, gt=0)
+    seed: int | None = None
+    stop: str | list[str] | None = None
+    tools: list[dict[str, Any]] | None = None
+    tool_choice: str | dict[str, Any] | None = None
+    parallel_tool_calls: bool | None = None
+    response_format: dict[str, Any] | None = None
+
+    @field_validator("messages")
+    @classmethod
+    def messages_are_not_empty(cls, value: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        if not value:
+            raise ValueError("messages cannot be empty")
+        return value
+
+    @property
+    def output_limit(self) -> int | None:
+        if self.max_completion_tokens is not None:
+            return self.max_completion_tokens
+        return self.max_tokens
+
+
+class MaintenanceStatus(BaseModel):
+    mode: str
+    workers: list[dict[str, Any]]
+
+
+class ModelVerificationTrustRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    reason: str = Field(min_length=1, max_length=1000)
